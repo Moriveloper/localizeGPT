@@ -1,0 +1,6 @@
+langchain==0.0.125
+openai==0.27.2
+pypdf==3.7.0
+tiktoken==0.3.3
+gradio==3.23
+boto3==1.18.20
