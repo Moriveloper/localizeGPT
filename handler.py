@@ -180,7 +180,7 @@ def get_thread_url(thread_ts, channel):
 
     # メッセージからURLを取得するために正規表現を用意
     user_id_pattern = re.compile(re.escape(URL_SUMMARIZER_ID))
-    url_pattern = r'https?://\S+?(?=>)'
+    url_pattern = r'<(https?://[^|]+)'
 
     next_cursor = None
     while True:
@@ -316,7 +316,7 @@ def lambda_handler(event, context):
             print("text: " + text)
 
             # Slack本文から正規表現を使ってURLを切り出し
-            url_pattern = r'https?://\S+?(?=>)'
+            url_pattern = r'<(https?://[^|]+)'
             urls = re.findall(url_pattern, text)
             if urls:
                 url = urls[0]
