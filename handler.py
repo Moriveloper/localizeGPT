@@ -91,7 +91,7 @@ def download_dir_s3(dirpath, s3bucket):
     return os.path.join('/tmp/', dirpath)
 
 # DynamoDBへ保存処理
-def write_to_dynamo(url, s3_path, summarize_result):
+def write_to_dynamo(url, s3_path, summarize_result, channel_name, user_name):
     dynamodb = boto3.resource('dynamodb')
     table_name = os.environ["TABLE_NAME"]
     table = dynamodb.Table(table_name)
@@ -103,6 +103,8 @@ def write_to_dynamo(url, s3_path, summarize_result):
             'Url': url,
             'AttributeType': "S3Key",
             'AttributeValue': s3_path,
+            'ChannelName': channel_name,
+            'UserName': user_name,
             'SummarizeResult': summarize_result,
             'created_at': now.isoformat()
         }
@@ -215,6 +217,48 @@ def get_thread_url(thread_ts, channel):
     # URLが見つからなかった場合は空文字列を返却
     return ""
 
+# Slackチャンネル名を取得
+def get_channel_name(channel_id):
+    headers = {
+        'Authorization': 'Bearer ' + os.environ['SLACK_BOT_TOKEN'],
+        'Content-type': 'application/json; charset=utf-8'
+    }
+    params = {
+        'channel': channel_id
+    }
+    response = requests.get(
+        'https://slack.com/api/conversations.info',
+        params=params,
+        headers=headers
+    )
+    response.raise_for_status()  # 応答のステータスコードが200以外の場合にエラーを発生させる
+    data = response.json()
+    if data.get('ok'):
+        return data['channel'].get('name', 'Unknown channel')
+    else:
+        return 'Unknown channel'
+
+# Slackユーザー名を取得
+def get_user_name(user_id):
+    headers = {
+        'Authorization': 'Bearer ' + os.environ['SLACK_BOT_TOKEN'],
+        'Content-type': 'application/json; charset=utf-8'
+    }
+    params = {
+        'user': user_id
+    }
+    response = requests.get(
+        'https://slack.com/api/users.info',
+        params=params,
+        headers=headers
+    )
+    response.raise_for_status()  # 応答のステータスコードが200以外の場合にエラーを発生させる
+    data = response.json()
+    if data.get('ok'):
+        user = data['user']
+        return user.get('real_name', user.get('name', 'Unknown user'))
+    else:
+        return 'Unknown user'
 
 def lambda_handler(event, context):
     print(f"Event: {json.dumps(event)}")
@@ -267,6 +311,8 @@ def lambda_handler(event, context):
             channel = body['event']['channel']
             thread_ts = body['event']['ts']
             text = body['event']['text']
+            channel_id = body["event"]["channel"]
+            user_id = body["event"]["user"]
             print("text: " + text)
 
             # Slack本文から正規表現を使ってURLを切り出し
@@ -287,7 +333,7 @@ def lambda_handler(event, context):
                     send_slack_message(channel, message, thread_ts)
                 else:
                     # 投稿にurlが含まれておりので要約を行う
-                    print("Summarize.")
+                    print("Summarize start.")
 
                     processing_message = "データを学習して要約作成中です。"
                     send_slack_message(channel, processing_message, thread_ts)
@@ -322,14 +368,18 @@ def lambda_handler(event, context):
                     upload_dir_s3("/tmp/tmp_index", s3_bucket, s3_upload_path)
                     print("S3 uploaded: " + s3_upload_path)
 
+                    # チャンネル名とユーザー名を取得
+                    channel_name = get_channel_name(channel_id)
+                    user_name = get_user_name(user_id)
+
                     # DynamoDBへアップロードする
-                    write_to_dynamo(url, s3_upload_path, summarize_result)
+                    write_to_dynamo(url, s3_upload_path, summarize_result, channel_name, user_name)
                     print("DynamoDB write done!")
 
                     send_slack_message(channel, summarize_result, thread_ts)
             else:
                 # 投稿自体にurlが含まれていないので質問と判断
-                print("QA.")
+                print("QA start.")
 
                 # スレッドから対象となるURLを取得する
                 if 'thread_ts' in body['event']:
