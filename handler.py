@@ -199,11 +199,9 @@ def get_thread_url(thread_ts, channel):
 
         # 該当スレッドのメッセージ
         messages = data['messages']
-        print("messages: " + json.dumps(messages))
 
         # メッセージを一つずつチェックしていく
         for message in messages:
-            print("message: " + json.dumps(message))
             if re.search(user_id_pattern, message['text']) and re.search(url_pattern, message['text']):
                 url = re.search(url_pattern, message['text']).group(0)
                 print(f"Found URL: {url}")
@@ -264,89 +262,102 @@ def lambda_handler(event, context):
 
     # メンション時
     if body['event']['type'] == 'app_mention':
-        # 呼び出しもとSlack情報
-        channel = body['event']['channel']
-        thread_ts = body['event']['ts']
-        text = body['event']['text']
-        print("text: " + text)
+        try:
+            # 呼び出しもとSlack情報
+            channel = body['event']['channel']
+            thread_ts = body['event']['ts']
+            text = body['event']['text']
+            print("text: " + text)
 
-        # Slack本文から正規表現を使ってURLを切り出し
-        url_pattern = r'https?://\S+?(?=>)'
-        urls = re.findall(url_pattern, text)
-        if urls:
-            url = urls[0]
-            url_contain = True
-            print("url: " + url)
-        else:
-            url_contain = False
-
-        if url_contain:
-            item = get_from_dynamo(url)
-            if item is not None:
-                print("Already summarized.")
-                message = item["SummarizeResult"]
-                send_slack_message(channel, message, thread_ts)
+            # Slack本文から正規表現を使ってURLを切り出し
+            url_pattern = r'https?://\S+?(?=>)'
+            urls = re.findall(url_pattern, text)
+            if urls:
+                url = urls[0]
+                url_contain = True
+                print("url: " + url)
             else:
-                # 投稿にurlが含まれておりので要約を行う
-                print("Summarize.")
+                url_contain = False
 
-                processing_message = "データを学習して要約作成中です。"
-                send_slack_message(channel, processing_message, thread_ts)
-
-                # テキストを取得してtext_listに格納
-                text_list = []
-                if urlparse(url).path.endswith('.pdf'):
-                    text_list.extend(get_pdf_text(url))
+            if url_contain:
+                item = get_from_dynamo(url)
+                if item is not None:
+                    print("Already summarized.")
+                    message = item["SummarizeResult"]
+                    send_slack_message(channel, message, thread_ts)
                 else:
-                    text_list.extend(get_webpage_texts(url))
-                print("text_list: " + text_list[1])
+                    # 投稿にurlが含まれておりので要約を行う
+                    print("Summarize.")
 
-                # テキストを学習用に分割する
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-                texts = text_splitter.split_text(text_list)
-                docs = [Document(page_content=t) for t in texts[:3]]
+                    processing_message = "データを学習して要約作成中です。"
+                    send_slack_message(channel, processing_message, thread_ts)
 
-                # 要約処理
-                summarize_template = PromptTemplate(
-                            template=summarize_prompt_template, input_variables=["text"])
-                chain = load_summarize_chain(llm, chain_type="map_reduce", map_prompt=summarize_template, combine_prompt=summarize_template)
-                summarize_result = chain.run(docs)
-                print("summarize_result: " + summarize_result)
+                    # テキストを取得してtext_listに格納
+                    text_list = []
+                    if urlparse(url).path.endswith('.pdf'):
+                        text_list.extend(get_pdf_text(url))
+                    else:
+                        text_list.extend(get_webpage_texts(url))
+                    print("text_list: " + text_list[1])
 
-                # ベクトルデータ化してindexを作成する
-                dbCreate = FAISS.from_documents(docs, embeddings)
-                dbCreate.save_local("/tmp/tmp_index")
-                print("Vectorize done!")
+                    # テキストを学習用に分割する
+                    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+                    texts = text_splitter.split_text(text_list)
+                    docs = [Document(page_content=t) for t in texts[:3]]
 
-                # S3へアップロードする
-                s3_upload_path = modify_url_to_s3_path(url)
-                upload_dir_s3("/tmp/tmp_index", s3_bucket, s3_upload_path)
-                print("S3 uploaded: " + s3_upload_path)
+                    # 要約処理
+                    summarize_template = PromptTemplate(
+                                template=summarize_prompt_template, input_variables=["text"])
+                    chain = load_summarize_chain(llm, chain_type="map_reduce", map_prompt=summarize_template, combine_prompt=summarize_template)
+                    summarize_result = chain.run(docs)
+                    print("summarize_result: " + summarize_result)
 
-                # DynamoDBへアップロードする
-                write_to_dynamo(url, s3_upload_path, summarize_result)
-                print("DynamoDB write done!")
+                    # ベクトルデータ化してindexを作成する
+                    dbCreate = FAISS.from_documents(docs, embeddings)
+                    dbCreate.save_local("/tmp/tmp_index")
+                    print("Vectorize done!")
 
-                send_slack_message(channel, summarize_result, thread_ts)
-        else:
-            # 投稿自体にurlが含まれていないので質問と判断
-            print("QA.")
+                    # S3へアップロードする
+                    s3_upload_path = modify_url_to_s3_path(url)
+                    upload_dir_s3("/tmp/tmp_index", s3_bucket, s3_upload_path)
+                    print("S3 uploaded: " + s3_upload_path)
 
-            # スレッドから対象となるURLを取得する
-            thread_head_ts = body['event']['thread_ts']
-            url = get_thread_url(thread_head_ts, channel)
-            print("QA url: " + url)
+                    # DynamoDBへアップロードする
+                    write_to_dynamo(url, s3_upload_path, summarize_result)
+                    print("DynamoDB write done!")
 
-            # DynamoDBから該当urlのベクトルデータが保存されているS3の情報を取得する
-            item = get_from_dynamo(url)
-            if item is not None:
-                # 質問からメンションを削除する
-                query = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
-                print("query: " + query)
-                # ChatGPTへQA処理
-                exec_qa(item, query, thread_ts, channel)
-
+                    send_slack_message(channel, summarize_result, thread_ts)
             else:
-                print("DynamoDB item not found.")
-                message = "回答を生成するためには学習元のURLが必要です。このスレッドからは学習元のURLが分かりません。"
-                send_slack_message(channel, message, thread_ts)
+                # 投稿自体にurlが含まれていないので質問と判断
+                print("QA.")
+
+                # スレッドから対象となるURLを取得する
+                if 'thread_ts' in body['event']:
+                    thread_head_ts = body['event']['thread_ts']
+                    url = get_thread_url(thread_head_ts, channel)
+                    print("QA url: " + url)
+                else:
+                    # スレッド内ではないメンション時にURLが入っていないことを想定
+                    message = "回答を生成するためには学習元のURLが必要です。"
+                    send_slack_message(channel, message, thread_ts)
+                    return
+
+                # DynamoDBから該当urlのベクトルデータが保存されているS3の情報を取得する
+                item = get_from_dynamo(url)
+                if item is not None:
+                    # 質問からメンションを削除する
+                    query = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
+                    print("query: " + query)
+                    # ChatGPTへQA処理
+                    exec_qa(item, query, thread_ts, channel)
+
+                else:
+                    print("DynamoDB item not found.")
+                    message = "回答を生成するためには学習元のURLが必要です。このスレッドからは学習元のURLが分かりません。"
+                    send_slack_message(channel, message, thread_ts)
+        
+        except Exception as e:
+            # めんどくさいので一旦全てのエラーを拾う
+            print(e)
+            message = "予期せぬエラーが発生しました。エンジ森にお知らせください。"
+            send_slack_message(channel, message, thread_ts)
