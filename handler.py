@@ -6,6 +6,7 @@ import openai
 import langchain
 import requests
 import pdfplumber
+import re
 
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -18,9 +19,21 @@ from langchain.chains import RetrievalQA
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from io import BytesIO
-from llama_index import GPTSimpleVectorIndex, SimpleDirectoryReader
+from datetime import datetime
 
-url = "https://www.mcf.bz/2021/12/31/post-4602/"
+URL_SUMMARIZER_ID = os.environ["URL_SUMMARIZER_ID"]
+BUCKET_NAME = os.environ["BUCKET_NAME"]
+
+# S3の準備
+s3 = boto3.resource('s3')
+s3_bucket = s3.Bucket(BUCKET_NAME)
+
+# ChatGPTの準備
+openai.api_key = os.environ["OPENAI_API_KEY"]
+llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
+embeddings = OpenAIEmbeddings()
+
+url = ""
 
 summarize_prompt_template = """以下の文章を簡潔に要約してください。:
 
@@ -78,7 +91,7 @@ def download_dir_s3(dirpath, s3bucket):
     return os.path.join('/tmp/', dirpath)
 
 # DynamoDBへ保存処理
-def write_to_dynamo(url, s3_path):
+def write_to_dynamo(url, s3_path, summarize_result):
     dynamodb = boto3.resource('dynamodb')
     table_name = os.environ["TABLE_NAME"]
     table = dynamodb.Table(table_name)
@@ -90,12 +103,16 @@ def write_to_dynamo(url, s3_path):
             'Url': url,
             'AttributeType': "S3Key",
             'AttributeValue': s3_path,
+            'SummarizeResult': summarize_result,
             'created_at': now.isoformat()
         }
     )
 
 # DynamoDBからの取得処理
 def get_from_dynamo(url):
+    if url == "":
+        return None
+
     dynamodb = boto3.resource('dynamodb')
     table_name = os.environ["TABLE_NAME"]
     table = dynamodb.Table(table_name)
@@ -114,86 +131,222 @@ def get_from_dynamo(url):
     else:
         return None
 
+# Slackへ返信する
+def send_slack_message(channel, text, thread_ts):
+    SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}"
+    }
+
+    data = {
+        "token": SLACK_BOT_TOKEN,
+        "channel": channel,
+        "text": text,
+        "thread_ts": thread_ts
+    }
+
+    response = requests.post("https://slack.com/api/chat.postMessage", json=data, headers=headers)
+    return response
+
+# VectorIndexを元にQA処理を行う
+def exec_qa(item, query, thread_ts, channel):
+    print("DynamoDB item: " + json.dumps(item))
+    s3_download_path = item["AttributeValue"]
+    print("s3_download_path: " + s3_download_path)
+
+    # S3から保存済みのVectorIndexを取得
+    index_dir = download_dir_s3(s3_download_path, s3_bucket)
+    dbDownload = FAISS.load_local(index_dir, embeddings)
+
+    # QA処理
+    qa_prompt = PromptTemplate(
+        template=qa_prompt_template, input_variables=["context", "question"]
+    )
+    chain_type_kwargs = {"prompt": qa_prompt}
+    qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=dbDownload.as_retriever(), chain_type_kwargs=chain_type_kwargs)
+    qa_result = qa.run(query)
+    print("qa_result: " + qa_result)
+    send_slack_message(channel, qa_result, thread_ts)
+
+# Slackのスレッドから元となる質問元となるURLを取得する
+def get_thread_url(thread_ts, channel):
+    headers = {
+        'Authorization': 'Bearer ' + os.environ['SLACK_BOT_TOKEN'],
+        'Content-type': 'application/json; charset=utf-8'
+    }
+
+    # メッセージからURLを取得するために正規表現を用意
+    user_id_pattern = re.compile(re.escape(URL_SUMMARIZER_ID))
+    url_pattern = r'https?://\S+?(?=>)'
+
+    next_cursor = None
+    while True:
+        params = {
+            'channel': channel,
+            'ts': thread_ts,
+            'cursor': next_cursor  # ページネーションのためのcursorパラメータ
+        }
+        response = requests.get(
+            'https://slack.com/api/conversations.replies',
+            params=params,
+            headers=headers
+        )
+        response.raise_for_status()  # 応答のステータスコードが200以外の場合にエラーを発生させる
+        data = response.json()
+        if not data.get('ok'):
+            raise RuntimeError(f"Slack API request failed: {data.get('error')}")
+
+        # 該当スレッドのメッセージ
+        messages = data['messages']
+        print("messages: " + json.dumps(messages))
+
+        # メッセージを一つずつチェックしていく
+        for message in messages:
+            print("message: " + json.dumps(message))
+            if re.search(user_id_pattern, message['text']) and re.search(url_pattern, message['text']):
+                url = re.search(url_pattern, message['text']).group(0)
+                print(f"Found URL: {url}")
+                return url
+
+        # 次のページが存在する場合、cursorを更新して再度リクエストを行う
+        next_cursor = data['response_metadata'].get('next_cursor')
+        if not next_cursor:
+            break
+
+    # URLが見つからなかった場合は空文字列を返却
+    return ""
+
+
 def lambda_handler(event, context):
-    # S3の準備
-    s3 = boto3.resource('s3')
-    bucket_name = os.environ["BUCKET_NAME"]
-    s3_bucket = s3.Bucket(bucket_name)
+    print(f"Event: {json.dumps(event)}")
+    body = json.loads(event['body'])
 
-    # ChatGPTの準備
-    openai.api_key = os.environ["OPENAI_API_KEY"]
-    llm = ChatOpenAI(temperature=0, model_name="gpt-3.5-turbo")
-    embeddings = OpenAIEmbeddings()
+    # Slackの疎通確認用
+    if body['type'] == 'url_verification':
+        print("Slack challenge.")
+        return {
+            'statusCode': 200,
+            'body': body['challenge']
+        }
 
-    url_contain = False
+    headers = event['headers']
+    # 処理に時間がかかりSlackに3秒以内にリクエストを返せないとリトライされる。Slackからのリトライは無視。
+    if 'x-slack-retry-reason' in headers or 'x-slack-retry-num' in headers:
+        print("Slack retry.")
+        return {
+            'statusCode': 200,
+            'body': "Slack retry. ok."
+        }
 
-    if url_contain:
-        # 投稿にurlが含まれているので要約を行う
-        print("Summarize.")
+    TEAM_ID = os.environ["TEAM_ID"]
+    API_APP_ID = os.environ["API_APP_ID"]
 
-        # TODO 要約およびデータ学習中ですと返信する
+    team_id = body['team_id']
+    api_app_id = body['api_app_id']
 
-        # テキストを取得してtext_listに格納
-        text_list = []
-        if urlparse(url).path.endswith('.pdf'):
-            text_list.extend(get_pdf_text(url))
+    # 変なリクエストは弾く
+    if team_id != TEAM_ID or api_app_id != API_APP_ID:
+        print("Not authorized.")
+        print("team_id: " + team_id)
+        print("api_app_id: " + api_app_id)
+        message = "TeamIDもしくはAppIDが不正です。エンジ森にお知らせください。"
+        send_slack_message(channel, message, thread_ts)
+        return {
+            'statusCode': 400,
+            'body': json.dumps({
+                'error': {
+                    'message': 'Invalid team ID or API app ID.',
+                    'code': 'INVALID_REQUEST'
+                }
+            })
+        }
+
+    # メンション時
+    if body['event']['type'] == 'app_mention':
+        # 呼び出しもとSlack情報
+        channel = body['event']['channel']
+        thread_ts = body['event']['ts']
+        text = body['event']['text']
+        print("text: " + text)
+
+        # Slack本文から正規表現を使ってURLを切り出し
+        url_pattern = r'https?://\S+?(?=>)'
+        urls = re.findall(url_pattern, text)
+        if urls:
+            url = urls[0]
+            url_contain = True
+            print("url: " + url)
         else:
-            text_list.extend(get_webpage_texts(url))
-        print("text_list: " + text_list[1])
+            url_contain = False
 
-        # テキストを学習用に分割する
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
-        texts = text_splitter.split_text(text_list)
-        docs = [Document(page_content=t) for t in texts[:3]]
+        if url_contain:
+            item = get_from_dynamo(url)
+            if item is not None:
+                print("Already summarized.")
+                message = item["SummarizeResult"]
+                send_slack_message(channel, message, thread_ts)
+            else:
+                # 投稿にurlが含まれておりので要約を行う
+                print("Summarize.")
 
-        要約処理
-        summarize_template = PromptTemplate(
-                    template=summarize_prompt_template, input_variables=["text"])
-        chain = load_summarize_chain(llm, chain_type="map_reduce", map_prompt=summarize_template, combine_prompt=summarize_template)
-        summarize_result = chain.run(docs)
-        print("summarize_result: " + summarize_result)
+                processing_message = "データを学習して要約作成中です。"
+                send_slack_message(channel, processing_message, thread_ts)
 
-        ベクトルデータ化してindexを作成する
-        dbCreate = FAISS.from_documents(docs, embeddings)
-        dbCreate.save_local("/tmp/tmp_index")
-        print("Vectorize done!")
+                # テキストを取得してtext_listに格納
+                text_list = []
+                if urlparse(url).path.endswith('.pdf'):
+                    text_list.extend(get_pdf_text(url))
+                else:
+                    text_list.extend(get_webpage_texts(url))
+                print("text_list: " + text_list[1])
 
-        # S3へアップロードする
-        s3_upload_path = modify_url_to_s3_path(url)
-        upload_dir_s3("/tmp/tmp_index", s3_bucket, s3_upload_path)
-        print("S3 uploaded: " + s3_upload_path)
+                # テキストを学習用に分割する
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
+                texts = text_splitter.split_text(text_list)
+                docs = [Document(page_content=t) for t in texts[:3]]
 
-        # DynamoDBへアップロードする
-        write_to_dynamo(url, s3_path)
-        print("DynamoDB write done!")
+                # 要約処理
+                summarize_template = PromptTemplate(
+                            template=summarize_prompt_template, input_variables=["text"])
+                chain = load_summarize_chain(llm, chain_type="map_reduce", map_prompt=summarize_template, combine_prompt=summarize_template)
+                summarize_result = chain.run(docs)
+                print("summarize_result: " + summarize_result)
 
-        # TODO summarize_resultを返信する
-    else:
-        # 投稿自体にurlが含まれていないので質問と判断
-        print("QA.")
+                # ベクトルデータ化してindexを作成する
+                dbCreate = FAISS.from_documents(docs, embeddings)
+                dbCreate.save_local("/tmp/tmp_index")
+                print("Vectorize done!")
 
-        # DynamoDBから該当urlのベクトルデータが保存されているS3の情報を取得する
-        item = get_from_dynamo(url)
-        if item is not None:
-            print("DynamoDB item: " + json.dumps(item))
-            s3_download_path = item["AttributeValue"]
-            print(s3_download_path)
+                # S3へアップロードする
+                s3_upload_path = modify_url_to_s3_path(url)
+                upload_dir_s3("/tmp/tmp_index", s3_bucket, s3_upload_path)
+                print("S3 uploaded: " + s3_upload_path)
 
-            # S3から保存済みのVectorIndexを取得
-            index_dir = download_dir_s3(s3_download_path, s3_bucket)
-            dbDownload = FAISS.load_local(index_dir, embeddings)
+                # DynamoDBへアップロードする
+                write_to_dynamo(url, s3_upload_path, summarize_result)
+                print("DynamoDB write done!")
 
-            # QA処理
-            qa_prompt = PromptTemplate(
-                template=qa_prompt_template, input_variables=["context", "question"]
-            )
-            chain_type_kwargs = {"prompt": qa_prompt}
-            qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=dbDownload.as_retriever(), chain_type_kwargs=chain_type_kwargs)
-            query = "MCFの強さとは？"
-            qa_result = qa.run(query)
-            print(qa_result)
+                send_slack_message(channel, summarize_result, thread_ts)
         else:
-            print("DynamoDB item not found.")
-            # TODO どのURLに対する質問かわからなかったよと返信する
+            # 投稿自体にurlが含まれていないので質問と判断
+            print("QA.")
 
+            # スレッドから対象となるURLを取得する
+            thread_head_ts = body['event']['thread_ts']
+            url = get_thread_url(thread_head_ts, channel)
+            print("QA url: " + url)
 
+            # DynamoDBから該当urlのベクトルデータが保存されているS3の情報を取得する
+            item = get_from_dynamo(url)
+            if item is not None:
+                # 質問からメンションを削除する
+                query = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
+                print("query: " + query)
+                # ChatGPTへQA処理
+                exec_qa(item, query, thread_ts, channel)
+
+            else:
+                print("DynamoDB item not found.")
+                message = "回答を生成するためには学習元のURLが必要です。このスレッドからは学習元のURLが分かりません。"
+                send_slack_message(channel, message, thread_ts)
