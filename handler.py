@@ -41,7 +41,7 @@ summarize_prompt_template = """以下の文章を簡潔に要約してくださ�
 
 要約:"""
 
-qa_prompt_template = """Use the following pieces of context to answer the question at the end. If you don't know the answer, just say that you don't know, don't try to make up an answer.
+qa_prompt_template = """Use the following pieces of context to answer the question at the end. If you don't know the answer, make up an answer.
 
 {context}
 
@@ -67,13 +67,14 @@ def get_pdf_text(url):
             text_list.append(page.extract_text())
     return text_list
 
-# URLをフォルダ名に変更
+# URLをS3フォルダ名に変更 domain-yyyymmddhhmmssの形にする
 def modify_url_to_s3_path(url):
-    modified_string = url.replace("https://", "")
-    modified_string = modified_string.replace("/", "-")
-    modified_string = modified_string.rstrip("-")
-    modified_string = modified_string.rstrip(".")
-    return modified_string
+    now = datetime.now()
+    timestamp = now.strftime("%Y%m%d%H%M%S")
+    parsed_url = url.split("/")
+    domain = parsed_url[2].replace(".", "-")
+    new_url = f"{domain}-{timestamp}"
+    return new_url
 
 # S3にディレクトリを格納
 def upload_dir_s3(dirpath, s3bucket, s3_path):
@@ -180,7 +181,7 @@ def get_thread_url(thread_ts, channel):
 
     # メッセージからURLを取得するために正規表現を用意
     user_id_pattern = re.compile(re.escape(URL_SUMMARIZER_ID))
-    url_pattern = r'<(https?://[^|>]+)'
+    url_pattern = r'(https?://[^|>]+)'
 
     next_cursor = None
     while True:
@@ -292,8 +293,6 @@ def lambda_handler(event, context):
         print("Not authorized.")
         print("team_id: " + team_id)
         print("api_app_id: " + api_app_id)
-        message = "TeamIDもしくはAppIDが不正です。エンジ森にお知らせください。"
-        send_slack_message(channel, message, thread_ts)
         return {
             'statusCode': 400,
             'body': json.dumps({
@@ -316,7 +315,7 @@ def lambda_handler(event, context):
             print("text: " + text)
 
             # Slack本文から正規表現を使ってURLを切り出し
-            url_pattern = r'<(https?://[^|>]+)'
+            url_pattern = r'(https?://[^|>]+)'
             urls = re.findall(url_pattern, text)
             if urls:
                 url = urls[0]
