@@ -194,6 +194,7 @@ def exec_qa(item, query, thread_ts, channel, thread_head_ts):
     doc_chain = load_qa_chain(llm, chain_type="stuff", prompt=qa_prompt)
 
     # スレッドの過去発言を取得
+    message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_head_ts)
     history_data = get_history(thread_head_ts)
     print("history_data: " + json.dumps(history_data))
     chat_history = []
