@@ -15,7 +15,11 @@ from langchain.docstore.document import Document
 from langchain.chains.summarize import load_summarize_chain
 from langchain.prompts import PromptTemplate
 from langchain.vectorstores import FAISS
-from langchain.chains import RetrievalQA
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory.chat_message_histories import DynamoDBChatMessageHistory
+from langchain.chains import LLMChain
+from langchain.chains.question_answering import load_qa_chain
+from langchain.chains.conversational_retrieval.prompts import CONDENSE_QUESTION_PROMPT
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from io import BytesIO
@@ -23,6 +27,7 @@ from datetime import datetime
 
 URL_SUMMARIZER_ID = os.environ["URL_SUMMARIZER_ID"]
 BUCKET_NAME = os.environ["BUCKET_NAME"]
+SESSION_TABLE_NAME = os.environ["SESSION_TABLE_NAME"]
 
 # S3の準備
 s3 = boto3.resource('s3')
@@ -134,6 +139,24 @@ def get_from_dynamo(url):
     else:
         return None
 
+# DynamoDBから会話履歴処理
+def get_history(session_id):
+    dynamodb = boto3.resource('dynamodb')
+    table = dynamodb.Table(SESSION_TABLE_NAME)
+
+    # データを取得する
+    response = table.get_item(
+        Key={
+            'SessionId': session_id
+        }
+    )
+
+    # 取得した項目が存在するかを確認
+    if 'Item' in response:
+        return response['Item']
+    else:
+        return None
+
 # Slackへ返信する
 def send_slack_message(channel, text, thread_ts):
     SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
@@ -153,7 +176,7 @@ def send_slack_message(channel, text, thread_ts):
     return response
 
 # VectorIndexを元にQA処理を行う
-def exec_qa(item, query, thread_ts, channel):
+def exec_qa(item, query, thread_ts, channel, thread_head_ts):
     print("DynamoDB item: " + json.dumps(item))
     s3_download_path = item["AttributeValue"]
     print("s3_download_path: " + s3_download_path)
@@ -166,11 +189,34 @@ def exec_qa(item, query, thread_ts, channel):
     qa_prompt = PromptTemplate(
         template=qa_prompt_template, input_variables=["context", "question"]
     )
-    chain_type_kwargs = {"prompt": qa_prompt}
-    qa = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=dbDownload.as_retriever(), chain_type_kwargs=chain_type_kwargs)
-    qa_result = qa.run(query)
-    print("qa_result: " + qa_result)
-    send_slack_message(channel, qa_result, thread_ts)
+
+    question_generator = LLMChain(llm=llm, prompt=CONDENSE_QUESTION_PROMPT)
+    doc_chain = load_qa_chain(llm, chain_type="stuff", prompt=qa_prompt)
+
+    # スレッドの過去発言を取得
+    history_data = get_history(thread_head_ts)
+    print("history_data: " + json.dumps(history_data))
+    chat_history = []
+
+    # "History"の下のリストをループ処理してchat_historyを生成
+    human_content = ''
+    for history_item in history_data["History"]:
+        if history_item["type"] == "human":
+            human_content = history_item["data"]["content"]
+        elif history_item["type"] == "ai" and human_content:
+            ai_content = history_item["data"]["content"]
+            chat_history.append((human_content, ai_content))
+            human_content = ''
+    print(chat_history)
+
+    qa = ConversationalRetrievalChain(retriever=dbDownload.as_retriever(), question_generator=question_generator, combine_docs_chain=doc_chain)
+    qa_result = qa({"question": query, "chat_history": chat_history})
+
+    print("qa_result: " + qa_result["answer"])
+
+    # DynamoDBにChatGPTの回答を保存
+    message_history.add_ai_message(qa_result["answer"])
+    send_slack_message(channel, qa_result["answer"], thread_ts)
 
 # Slackのスレッドから元となる質問元となるURLを取得する
 def get_thread_url(thread_ts, channel):
@@ -325,10 +371,18 @@ def lambda_handler(event, context):
                 url_contain = False
 
             if url_contain:
+
+                # 対話を記憶させるためのテーブル準備 IDはSlackのスレッド頭のthread_tsにする
+                message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_ts)
+                # 質問からメンションを削除してDynamoDBにユーザーの発言を保存
+                user_message = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
+                message_history.add_user_message(user_message)
+
                 item = get_from_dynamo(url)
                 if item is not None:
                     print("Already summarized.")
                     message = item["SummarizeResult"]
+                    message_history.add_ai_message(message)
                     send_slack_message(channel, message, thread_ts)
                 else:
                     # 投稿にurlが含まれておりので要約を行う
@@ -375,6 +429,8 @@ def lambda_handler(event, context):
                     write_to_dynamo(url, s3_upload_path, summarize_result, channel_name, user_name)
                     print("DynamoDB write done!")
 
+                    # DynamoDBにChatGPTの回答を保存
+                    message_history.add_ai_message(summarize_result)
                     send_slack_message(channel, summarize_result, thread_ts)
             else:
                 # 投稿自体にurlが含まれていないので質問と判断
@@ -385,6 +441,13 @@ def lambda_handler(event, context):
                     thread_head_ts = body['event']['thread_ts']
                     url = get_thread_url(thread_head_ts, channel)
                     print("QA url: " + url)
+
+                    # 対話を記憶させるためのテーブル準備 IDはSlackのスレッド頭のthread_tsにする
+                    message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_head_ts)
+                    # 質問からメンションを削除してDynamoDBにユーザーの発言を保存
+                    user_message = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
+                    message_history.add_user_message(user_message)
+
                 else:
                     # スレッド内ではないメンション時にURLが入っていないことを想定
                     message = "回答を生成するためには学習元のURLが必要です。"
@@ -398,7 +461,7 @@ def lambda_handler(event, context):
                     query = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
                     print("query: " + query)
                     # ChatGPTへQA処理
-                    exec_qa(item, query, thread_ts, channel)
+                    exec_qa(item, query, thread_ts, channel, thread_head_ts)
 
                 else:
                     print("DynamoDB item not found.")
