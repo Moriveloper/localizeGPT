@@ -46,9 +46,12 @@ summarize_prompt_template = """以下の文章を簡潔に要約してくださ�
 
 要約:"""
 
-qa_prompt_template = """Use the following pieces of context to answer the question at the end. If you don't know the answer, make up an answer.
+qa_prompt_template = """
 
 {context}
+
+Based on this, answer the following question.
+If there is no answer that seems to correspond to the question above, please guess.
 
 Question: {question}
 Answer in Japanese:"""
@@ -151,11 +154,23 @@ def get_history(session_id):
         }
     )
 
+    chat_history = []
     # 取得した項目が存在するかを確認
-    if 'Item' in response:
-        return response['Item']
+    if 'Item' in response and response['Item'].get("History") is not None:
+        # "History"の下のリストをループ処理してchat_historyを生成
+        human_content = ''
+        for history_item in response['Item']["History"]:
+            if history_item["type"] == "human":
+                human_content = history_item["data"]["content"]
+            elif history_item["type"] == "ai" and human_content:
+                ai_content = history_item["data"]["content"]
+                chat_history.append((human_content, ai_content))
+                human_content = ''
+        print(chat_history)
+        return chat_history
     else:
-        return None
+        print(chat_history)
+        return chat_history
 
 # Slackへ返信する
 def send_slack_message(channel, text, thread_ts):
@@ -195,20 +210,7 @@ def exec_qa(item, query, thread_ts, channel, thread_head_ts):
 
     # スレッドの過去発言を取得
     message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_head_ts)
-    history_data = get_history(thread_head_ts)
-    print("history_data: " + json.dumps(history_data))
-    chat_history = []
-
-    # "History"の下のリストをループ処理してchat_historyを生成
-    human_content = ''
-    for history_item in history_data["History"]:
-        if history_item["type"] == "human":
-            human_content = history_item["data"]["content"]
-        elif history_item["type"] == "ai" and human_content:
-            ai_content = history_item["data"]["content"]
-            chat_history.append((human_content, ai_content))
-            human_content = ''
-    print(chat_history)
+    chat_history = get_history(thread_head_ts)
 
     qa = ConversationalRetrievalChain(retriever=dbDownload.as_retriever(), question_generator=question_generator, combine_docs_chain=doc_chain)
     qa_result = qa({"question": query, "chat_history": chat_history})
@@ -258,7 +260,7 @@ def get_thread_url(thread_ts, channel):
                 return url
 
         # 次のページが存在する場合、cursorを更新して再度リクエストを行う
-        next_cursor = data['response_metadata'].get('next_cursor')
+        next_cursor = data.get('response_metadata', {}).get('next_cursor')
         if not next_cursor:
             break
 
@@ -398,7 +400,7 @@ def lambda_handler(event, context):
                         text_list.extend(get_pdf_text(url))
                     else:
                         text_list.extend(get_webpage_texts(url))
-                    print("text_list: " + text_list[1])
+                    print("text_list: " + text_list[0])
 
                     # テキストを学習用に分割する
                     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=0)
@@ -436,6 +438,14 @@ def lambda_handler(event, context):
             else:
                 # 投稿自体にurlが含まれていないので質問と判断
                 print("QA start.")
+                # 質問からメンションを削除する
+                query = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
+                print("query: " + query)
+
+                # 後から使うかもなので空VectorIndexでConversationalRetrievalChainを用意しておく
+                dummy_index = download_dir_s3("dummy-empty-vectorindex", s3_bucket)
+                dummy_db = FAISS.load_local(dummy_index, embeddings)
+                qa = ConversationalRetrievalChain.from_llm(llm, dummy_db.as_retriever())
 
                 # スレッドから対象となるURLを取得する
                 if 'thread_ts' in body['event']:
@@ -445,29 +455,38 @@ def lambda_handler(event, context):
 
                     # 対話を記憶させるためのテーブル準備 IDはSlackのスレッド頭のthread_tsにする
                     message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_head_ts)
-                    # 質問からメンションを削除してDynamoDBにユーザーの発言を保存
-                    user_message = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
-                    message_history.add_user_message(user_message)
+                    # DynamoDBにユーザーの発言を保存
+                    message_history.add_user_message(query)
 
                 else:
                     # スレッド内ではないメンション時にURLが入っていないことを想定
-                    message = "回答を生成するためには学習元のURLが必要です。"
-                    send_slack_message(channel, message, thread_ts)
+                    # DynamoDBにユーザーの発言を保存
+                    message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_ts)
+                    message_history.add_user_message(query)
+
+                    qa_result = qa({"question": query, "chat_history": []})
+
+                    print("qa_result: " + qa_result["answer"])
+
+                    # DynamoDBにChatGPTの回答を保存
+                    message_history.add_ai_message(qa_result["answer"])
+                    send_slack_message(channel, qa_result["answer"], thread_ts)
                     return
 
                 # DynamoDBから該当urlのベクトルデータが保存されているS3の情報を取得する
                 item = get_from_dynamo(url)
                 if item is not None:
-                    # 質問からメンションを削除する
-                    query = re.sub(re.escape(URL_SUMMARIZER_ID), '', text)
-                    print("query: " + query)
                     # ChatGPTへQA処理
                     exec_qa(item, query, thread_ts, channel, thread_head_ts)
 
                 else:
+                    # スレッド内でURL要約が行われていないのにメンションされたことを想定
                     print("DynamoDB item not found.")
-                    message = "回答を生成するためには学習元のURLが必要です。このスレッドからは学習元のURLが分かりません。"
-                    send_slack_message(channel, message, thread_ts)
+                    chat_history = get_history(thread_head_ts)
+                    qa_result = qa({"question": query, "chat_history": chat_history})
+                    print("qa_result: " + qa_result["answer"])
+                    
+                    send_slack_message(channel, qa_result["answer"], thread_ts)
         
         except Exception as e:
             # めんどくさいので一旦全てのエラーを拾う
