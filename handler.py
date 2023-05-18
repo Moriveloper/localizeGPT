@@ -212,7 +212,12 @@ def exec_qa(item, query, thread_ts, channel, thread_head_ts):
     message_history = DynamoDBChatMessageHistory(table_name=SESSION_TABLE_NAME, session_id=thread_head_ts)
     chat_history = get_history(thread_head_ts)
 
-    qa = ConversationalRetrievalChain(retriever=dbDownload.as_retriever(), question_generator=question_generator, combine_docs_chain=doc_chain)
+    # 無視という単語が入っていたらベクトルデータを参考にせずに質問させる
+    if "無視" in query:
+        qa = ConversationalRetrievalChain(retriever=dbDownload.as_retriever(), question_generator=question_generator, combine_docs_chain=doc_chain)
+    else:
+        qa = ConversationalRetrievalChain.from_llm(llm, dbDownload.as_retriever())
+
     qa_result = qa({"question": query, "chat_history": chat_history})
 
     print("qa_result: " + qa_result["answer"])
