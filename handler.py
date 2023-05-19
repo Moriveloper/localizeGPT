@@ -50,11 +50,10 @@ qa_prompt_template = """
 
 {context}
 
-Based on this, answer the following question.
-If there is no answer that seems to correspond to the question above, please guess.
+これを踏まえて、次の質問に答えてください。
 
-Question: {question}
-Answer in Japanese:"""
+質問: {question}
+日本語で回答してください。:"""
 
 # Webページからテキストを抽出
 def get_webpage_texts(url):
